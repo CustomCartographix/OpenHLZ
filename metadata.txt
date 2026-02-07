@@ -6,7 +6,7 @@
 name=OpenHLZ
 qgisMinimumVersion=3.0
 description=An Open-source HLZ Identification Processing Plugin
-version=1.0
+version=2.0.0
 author=CustomCartographix
 email=john@CustomCartographix.com
 

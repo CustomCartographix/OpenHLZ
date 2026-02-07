@@ -1,5 +1,7 @@
 # OpenHLZ: An Open-Source HLZ Identification Toolkit
 
+***Version 2.0.0***
+
 ***OpenHLZ*** Provides allows users to quickly identify possible helicopter landing zones (HLZs) anywhere in the world.  Using a user-defined area of interest (AOI), this model automatically downloads the required data needed to identify HLZs that meet the criteria defined by the user.
 
 ![Example of model output](doc/example_1.jpg)
@@ -91,3 +93,17 @@ This tool identifies possible HLZs based on a user-defined AOI (vector file).
 * ***Slope Caution Value*** defines the slope magnitude, in degrees, beyond which a helicopter touching down MAY exceed a slope limitation.
 * ***Slope Limit Value*** defines the slope magnitude, in degrees, beyond which a helicopter touching down WILL exceed a slope limitation.
 * The ***DEM Data Source*** box allows the user to choose the elevation data source.
+
+### <img src="images/polygon_icon.svg" width="20"> Identify HLZs from Existing Data
+
+![Example existing data tool](doc/existing_data_example.jpg)
+
+This tool identifies possible HLZs based on a user-defined AOI using existing data instead of downloading data.
+
+* ***Input Elevation Raster*** is the input DEM.
+* ***Input Land Cover Raster*** is the input land cover dataset.
+* ***Suitable Land Cover Class Pixel Values*** are classes in the land cover raster that the model will classify as suitable (i.e. grassland).  These should be input as pixel values separated by commas with no spaces.
+* ***Input AOI*** can be in any vector polygon format.
+* ***Touchdown Point Diameter*** is the diameter, in meters, of a suitable area a helicopter needs to safely land.
+* ***Slope Caution Value*** defines the slope magnitude, in degrees, beyond which a helicopter touching down MAY exceed a slope limitation.
+* ***Slope Limit Value*** defines the slope magnitude, in degrees, beyond which a helicopter touching down WILL exceed a slope limitation.
