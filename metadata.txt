@@ -4,14 +4,14 @@
 
 [general]
 name=OpenHLZ
-qgisMinimumVersion=3.0
+qgisMinimumVersion=3.34
 description=An Open-source HLZ Identification Processing Plugin
-version=2.0.0
+version=2.0.1
 author=CustomCartographix
 email=john@CustomCartographix.com
 
 about=This plugin provides basic functionality to identiy possible helicopter landing zones (HLZs).  Based on a point of interest (POI) or area of interest (AOI) defined by the user, this plugin will analyze slope and land cover data to determine possible locations to land a helicopter.  These sites are selected on land cover suitability and user-defined criteria, to include touchdown point (TDP) size and slope caution/limit thresholds (see README on GitHub for a more detailed explaination of methodology). A key feature of this tool is that it will automatically download the required data for analysis, so an internet connection is required to use it.
-    
+
     WARNING: The possible HLZ locations identified by this plugin are for research purposes only.  The results of this plugin have not been evaluated for accuracy and should not be relied upon as the sole means for determining where to land an aircraft.  It is ultimately the responsibiltiy of the pilot-in-command to determine the suitability of any location prior to landing their aircraft.  The developer of this plugin is not liable for ANY damage to equipment, bodily injury, or loss of life associated with its use.
 
 tracker=https://github.com/CustomCartographix/OpenHLZ/issues
@@ -22,7 +22,7 @@ repository=https://github.com/CustomCartographix/OpenHLZ
 
 hasProcessingProvider=yes
 # Uncomment the following line and add your changelog:
-changelog=Removed experimental flag. Changed data source options to fix bugs. Added ability to use pre-downloaded data for analysis.
+changelog=2.0.1 - Rewrote mosaic/clip around gdal.Warp to fix memory blowup on large AOIs; switched land cover source to the 2025 collection; raised qgisMinimumVersion to 3.34; hardened downloads, styling and file handling. See CHANGELOG.md for details.
 
 # Tags are comma separated with spaces allowed
 tags=python, QGIS, open-source, aviation, helicopters, processing, army, military, elevation, slope, land cover, DEM, LULC, terrain analysis, intelligence
@@ -46,4 +46,3 @@ Category of the plugin: Raster, Vector, Database or Web
 
 # If the plugin can run on QGIS Server.
 server=False
-

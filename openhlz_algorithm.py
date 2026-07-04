@@ -10,8 +10,8 @@
         begin                : 2023-08-13
         copyright            : (C) 2026 by CustomCartographix
         email                : john@customcartographix.com
-        version              : 2.0.0
-        version date         : 2026-01-31
+        version              : 2.0.1
+        version date         : 2026-07-04
  ***************************************************************************/
 
 /***************************************************************************
@@ -41,6 +41,8 @@ __revision__ = '$Format:%H$'
 
 
 # Import necessary modules
+import os
+
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 
@@ -53,269 +55,107 @@ from qgis.core import (QgsProcessing,
                        QgsProcessingParameterRasterDestination,
                        QgsProcessingParameterEnum,
                        QgsVectorLayer,
-                       QgsRasterLayer,
                        QgsCoordinateReferenceSystem,
-                       QgsVectorFileWriter,
                        QgsProcessingParameterFeatureSource,
                        QgsProcessingParameterRasterLayer,
                        QgsProcessingParameterString)
 
-from os import (chdir,
-                path)
 from tempfile import TemporaryDirectory
 from numpy import zeros
 from pandas import DataFrame
 
 from .openhlz_functions import (downloadCopernicusGlo30Data,
-                                getJson,
-                                downloadDem,
                                 downloadLandCoverRaster,
                                 mosaicAndClipRasters,
                                 generateHlsRaster,
-                                identifyHlzs)
+                                identifyHlzs,
+                                writeToShapefile,
+                                applyStyleOnLoad,
+                                HlsRasterStylePostProcessor,
+                                HlzPointsStylePostProcessor)
 
 
-class IdentifyHLZsFromLatLng(QgsProcessingAlgorithm):
+# Directory that this module (and the bundled data/styles) lives in. Building
+# absolute paths from here means the algorithms no longer depend on chdir()
+# mutating the whole QGIS process's working directory.
+PLUGIN_DIR = os.path.dirname(__file__)
+
+
+class _BaseHLZAlgorithm(QgsProcessingAlgorithm):
     """
-    Class to identify possible HLZs from lat/lng
+    Shared base class for the HLZ identification algorithms.
+
+    Holds the constants and the download/mosaic/HLS/HLZ pipeline that the
+    Lat/Lng, Point, and AOI algorithms all share, so the logic lives in exactly
+    one place. Subclasses only differ in how they build the AOI.
     """
 
-    # Define constants
-    # Inputs
-    LAT = "LAT"
-    LNG = "LNG"
-    SEARCHRADIUS = "SEARCHRADIUS"
-    TDPDIAMETER = "TDPDIAMETER"
-    SLOPECAUTION = "SLOPECAUTION"
-    SLOPELIMIT = "SLOPELIMIT"
-    DEMDATASOURCE = "DEMDATASOURCE"
-
-    # Outputs
+    # Outputs (common to every algorithm)
     OUTPUTHLZPOINTS = "OUTPUTHLZPOINTS"
     OUTPUTHLSRASTER = "OUTPUTHLSRASTER"
 
-    # Input lists
+    # DEM source options
     DEMSOURCELIST = [
         '(Global) Copernicus GLO-30 (30m)',
         '(US) 1/3 ArcSecond DEM (10m)'
     ]
 
-    # Other constants
-    CODEFILENAME = 'openhlz_algorithm.py'
+    # Model coordinate system
+    MODEL_CRS_NAME = 'epsg:3857'
 
-    def initAlgorithm(self, config):
+    # ------------------------------------------------------------------
+    # Small shared helpers
+    # ------------------------------------------------------------------
+    def tr(self, string):
+        return QCoreApplication.translate('Processing', string)
+
+    def group(self):
+        return self.tr('Download Data')
+
+    def groupId(self):
+        return 'downloaddata'
+
+    def helpUrl(self):
+        return "https://github.com/jojohn2468/openhlz/blob/master/README.md"
+
+    def modelCrs(self):
+        return QgsCoordinateReferenceSystem(self.MODEL_CRS_NAME)
+
+    def resourcePath(self, relative_path):
+        return os.path.join(PLUGIN_DIR, relative_path)
+
+    def hlsStylePath(self):
+        return self.resourcePath('styles/hls_raster_style.qml')
+
+    def hlzStylePath(self):
+        return self.resourcePath('styles/hlz_points_style.qml')
+
+    def newScratchFolder(self):
+        # delete + ignore_cleanup_errors require Python 3.10/3.12, which are
+        # guaranteed by qgisMinimumVersion=3.34.
+        self._temp_dir = TemporaryDirectory(delete=True, ignore_cleanup_errors=True)
+        return self._temp_dir.name
+
+    # ------------------------------------------------------------------
+    # Shared pipeline steps
+    # ------------------------------------------------------------------
+    def _downloadAndClipData(self, aoi_layer, dem_data_source, scratch_folder, feedback):
         """
-        Define inputs and outputs for algorithm
+        Download and clip the elevation and land cover data to the AOI.
+
+        Returns (clipped_dem_filename, clipped_lc_filename).
         """
+        clipped_dem_filename = os.path.join(scratch_folder, 'clipped_dem.tif')
 
-        # Save reference to project instance
-        self.instance = QgsProject.instance()
-
-        # Input LAT
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.LAT,
-                self.tr('Latitude (DDG)'),
-                QgsProcessingParameterNumber.Double,
-                minValue=-90.0,
-                maxValue=90.0
-            )
-        )
-
-        # Input LNG
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.LNG,
-                self.tr('Longitude (DDG)'),
-                QgsProcessingParameterNumber.Double,
-                minValue=-180.0,
-                maxValue=180.0
-            )
-        )
-
-        # Input search radius
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SEARCHRADIUS,
-                self.tr('Search Radius (m)'),
-                QgsProcessingParameterNumber.Integer,
-                defaultValue=5000,
-                minValue=0,
-                maxValue=100000
-            )
-        )
-
-        # Input TDP diameter
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.TDPDIAMETER,
-                self.tr('Touchdown Point Diameter (m)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=500
-            )
-        )
-
-        # Input slope caution value
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SLOPECAUTION,
-                self.tr('Slope Caution Value (°)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=45
-            )
-        )
-
-        # Input slope limit value
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SLOPELIMIT,
-                self.tr('Slope Limit Value (°)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=45
-            )
-        )
-
-        # DEM Data Source
-        self.addParameter(
-            QgsProcessingParameterEnum(
-                self.DEMDATASOURCE,
-                self.tr('DEM Data Source'),
-                options=self.DEMSOURCELIST,
-                defaultValue=0
-            )
-        )
-
-        # Add output for HLZ points
-        self.addParameter(
-            QgsProcessingParameterVectorDestination(
-                self.OUTPUTHLZPOINTS,
-                self.tr('Output HLZ Points'),
-                type=QgsProcessing.TypeVectorAnyGeometry
-            )
-        )
-
-        # Add output for HLS raster
-        self.addParameter(
-            QgsProcessingParameterRasterDestination(
-                self.OUTPUTHLSRASTER,
-                self.tr('Output HLS Raster')
-            )
-        )
-
-    def processAlgorithm(self, parameters, context, feedback):
-        """
-        Main processing function
-        """
-
-        # Assign inputs to variables
-        lat = self.parameterAsDouble(parameters, self.LAT, context)
-        lng = self.parameterAsDouble(parameters, self.LNG, context)
-        search_radius = self.parameterAsInt(parameters, self.SEARCHRADIUS, context)
-        tdp_diameter = self.parameterAsInt(parameters, self.TDPDIAMETER, context)
-        slope_caution = self.parameterAsInt(parameters, self.SLOPECAUTION, context)
-        slope_limit = self.parameterAsInt(parameters, self.SLOPELIMIT, context)
-        dem_source_list_index = self.parameterAsInt(parameters, self.DEMDATASOURCE, context)
-        dem_data_source = self.DEMSOURCELIST[dem_source_list_index]
-
-        # Assign outputs to variables
-        output_hlz_points = self.parameterAsOutputLayer(parameters, self.OUTPUTHLZPOINTS, context)
-        output_hls_raster = self.parameterAsOutputLayer(parameters, self.OUTPUTHLSRASTER, context)
-
-        """
-        ------------------------ Perform initial setup ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Performing Initial Setup...')
-
-        # Set initial working directory
-        current_path = __file__
-        working_directory = current_path.replace(self.CODEFILENAME, '')
-        chdir(working_directory)
-
-        # Define UTM layer (for LC data download)
-        utm_filename = 'data/World_UTM_Grid.shp'
-        utm_path = utm_filename
-        utm_layer = QgsVectorLayer(utm_path, 'World_UTM_Grid')
-
-        # Define 1/3 arc second DEM VRT (for DEM download)
-        vrt_filename = 'data/USGS_Seamless_DEM_13.vrt'
-
-        # Define necessary coordinate systems
-        model_coordinate_system_name = 'epsg:3857'
-        model_coordinate_system = QgsCoordinateReferenceSystem(model_coordinate_system_name)
-
-        # Paths for output styles
-        hls_style_path = 'styles/hls_raster_style.qml'
-        hlz_style_path = 'styles/hlz_points_style.qml'
-
-        # Create temporary directory for downloads/other data
-        temp_dir = TemporaryDirectory(delete=True, ignore_cleanup_errors=True)
-        scratch_folder = temp_dir.name
-
-        # Create point feature from lat/lng values
-        # Export lat/lng values to table
-        coordinate_array = zeros((1, 3))
-        coordinate_array[0][0] = 1
-        coordinate_array[0][1] = lat
-        coordinate_array[0][2] = lng
-        df = DataFrame(coordinate_array, columns=['id', 'lat', 'lng'])
-        df.to_csv(scratch_folder + '/coordinate_table.csv', index=False)
-
-        # Convert xy table to point and project into project crs
-        poi_layer = processing.run("native:createpointslayerfromtable", {
-            'INPUT': scratch_folder + '/coordinate_table.csv',
-            'XFIELD': 'lng',
-            'YFIELD': 'lat',
-            'ZFIELD': '',
-            'MFIELD': '',
-            'TARGET_CRS': QgsCoordinateReferenceSystem('EPSG:4326'),
-            'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
-
-        # Project POI layer to model coordinate system
-        poi_projected_layer = processing.run("native:reprojectlayer", {'INPUT': poi_layer,
-                                                                       'TARGET_CRS': model_coordinate_system,
-                                                                       'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
-
-        # Generate AOI
-        aoi_layer = processing.run("native:buffer", {'INPUT': poi_projected_layer,
-                                                     'DISTANCE': search_radius,
-                                                     'SEGMENTS': 5,
-                                                     'END_CAP_STYLE': 2,
-                                                     'JOIN_STYLE': 1,
-                                                     'MITER_LIMIT': 2,
-                                                     'DISSOLVE': False,
-                                                     'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
-
-        """
-        ------------------------ Download DEM Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-        
+        # -------------------- Elevation --------------------
         feedback.setProgressText('Downloading Elevation Data...')
-
-        # Variable for output DEM filenames
-        dem_return = []
-
-        # Download Copernicus Data
         if dem_data_source == self.DEMSOURCELIST[0]:
             feedback.setProgressText("Downloading Copernicus Elevation Data...")
-            temp_return = downloadCopernicusGlo30Data(aoi_layer, scratch_folder, model_coordinate_system_name)
-            dem_return.append(temp_return)
-
-        # Else 10m data
+            dem_file = downloadCopernicusGlo30Data(aoi_layer, scratch_folder, self.MODEL_CRS_NAME, feedback)
+            mosaicAndClipRasters([dem_file], aoi_layer, scratch_folder, clipped_dem_filename, feedback)
         else:
             feedback.setProgressText("Downloading 10m Elevation Data...")
-            clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
+            vrt_filename = self.resourcePath('data/USGS_Seamless_DEM_13.vrt')
             processing.run("gdal:cliprasterbymasklayer", {'INPUT': vrt_filename,
                                                           'MASK': aoi_layer,
                                                           'SOURCE_CRS': None,
@@ -334,108 +174,253 @@ class IdentifyHLZsFromLatLng(QgsProcessingAlgorithm):
                                                           'EXTRA': '',
                                                           'OUTPUT': clipped_dem_filename})
 
-        # Stop the algorithm if cancel button has been clicked
         if feedback.isCanceled():
-            return
+            return None, None
 
-        """
-        ------------------------ Download Land Cover Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
+        # -------------------- Land cover --------------------
         feedback.setProgressText('Downloading Land Cover Data...')
+        utm_layer = QgsVectorLayer(self.resourcePath('data/World_UTM_Grid.shp'), 'World_UTM_Grid')
 
-        # Select UTM zones that intersect input AOI
         processing.run("native:selectbylocation",
                        {'INPUT': utm_layer,
                         'PREDICATE': [0],
                         'INTERSECT': aoi_layer,
                         'METHOD': 0})
-        QgsVectorFileWriter.writeAsVectorFormat(utm_layer,
-                                                scratch_folder + '/selected_utm.shp',
-                                                'utf-8',
-                                                driverName='ESRI Shapefile',
-                                                onlySelected=True)
-        temp_selection = QgsVectorLayer(scratch_folder + '/selected_utm.shp', 'temp_selection')
-        temp_features = temp_selection.getFeatures()
+        selected_utm = os.path.join(scratch_folder, 'selected_utm.shp')
+        writeToShapefile(utm_layer, selected_utm, only_selected=True)
 
-        # Get zone IDs for necessary land cover files
-        utm_zones = []
-        for feature in temp_features:
-            utm_zones.append([feature[1], feature[2]])
+        temp_selection = QgsVectorLayer(selected_utm, 'temp_selection')
+        utm_zones = [[feature[1], feature[2]] for feature in temp_selection.getFeatures()]
 
-        # Variable for output land cover filenames
         lc_return = []
-
-        # Download necessary land cover files
         for i in range(len(utm_zones)):
-            # Stop the algorithm if cancel button has been clicked
             if feedback.isCanceled():
                 break
             feedback.setProgressText('Downloading Land Cover Data ' + str(i + 1) + '/' + str(len(utm_zones)))
-            temp_return = downloadLandCoverRaster(i, utm_zones, scratch_folder)
-            lc_return.append(temp_return)
+            lc_return.append(downloadLandCoverRaster(i, utm_zones, scratch_folder, feedback))
 
-        """
-        ------------------------ Mosaic and Clip Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
+        clipped_lc_filename = os.path.join(scratch_folder, 'clipped_lc.tif')
         feedback.setProgressText('Mosaicing and Clipping Data...')
+        mosaicAndClipRasters(lc_return, aoi_layer, scratch_folder, clipped_lc_filename, feedback)
 
-        # DEM Raster (only if Copernicus)
-        if dem_data_source == self.DEMSOURCELIST[0]:
-            clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
-            mosaicAndClipRasters(dem_return, aoi_layer, scratch_folder, clipped_dem_filename, self.instance)
+        return clipped_dem_filename, clipped_lc_filename
 
-        # Land Cover Raster
-        clipped_lc_filename = scratch_folder + '/clipped_lc.tif'
-        mosaicAndClipRasters(lc_return, aoi_layer, scratch_folder, clipped_lc_filename, self.instance)
-
+    def _computeHlsAndHlzs(self, output_hls_raster, output_hlz_points, clipped_dem_filename,
+                           clipped_lc_filename, slope_caution, slope_limit, tdp_diameter,
+                           scratch_folder, context, feedback, land_cover_classes='5,8,11'):
         """
-        ------------------------ Calculate HLS Raster ---------------------------------
+        Build the HLS raster, identify the HLZ points, register the output
+        styles, and return the algorithm result dictionary.
         """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
         feedback.setProgressText('Calculating HLS Raster...')
+        hls_raster = generateHlsRaster(output_hls_raster, clipped_dem_filename, clipped_lc_filename,
+                                       slope_caution, slope_limit, self.modelCrs(), scratch_folder,
+                                       suitable_land_cover_classes=land_cover_classes)
 
-        hls_raster = generateHlsRaster(output_hls_raster, clipped_dem_filename, clipped_lc_filename, slope_caution,
-                                       slope_limit, model_coordinate_system, hls_style_path, self.instance,
-                                       scratch_folder)
-
-        """
-        ------------------------ ID HLZs ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
         if feedback.isCanceled():
-            return
+            return {}
 
         feedback.setProgressText('Identifying Possible HLZs...')
+        hlz_points = identifyHlzs(output_hlz_points, hls_raster, tdp_diameter, self.modelCrs(), scratch_folder)
 
-        # Identify HLZ points
-        hlz_points = identifyHlzs(output_hlz_points, hls_raster, tdp_diameter, model_coordinate_system,
-                                  hlz_style_path, self.instance, scratch_folder)
-
-        """
-        ------------------------ Return ---------------------------------
-        """
+        # Style the outputs the framework loads on completion
+        applyStyleOnLoad(context, output_hls_raster, HlsRasterStylePostProcessor, self.hlsStylePath())
+        applyStyleOnLoad(context, output_hlz_points, HlzPointsStylePostProcessor, self.hlzStylePath())
 
         feedback.setProgressText('...Complete!')
-
         return {
             self.OUTPUTHLSRASTER: hls_raster,
             self.OUTPUTHLZPOINTS: hlz_points
         }
+
+    # Shared warning text for the help strings
+    _WARNING = (
+        "WARNING: The possible HLZ locations identified by this plugin are for research purposes only.  The "
+        "results of this plugin have not been evaluated for accuracy and should not be relied upon as the sole "
+        "means for determining where to land an aircraft.  It is ultimately the responsibility of the "
+        "pilot-in-command to determine the suitability of any location prior to landing their aircraft.  The "
+        "developer of this plugin is not liable for ANY damage to equipment, bodily injury, or loss of life "
+        "associated with its use.")
+
+
+class _BaseDownloadHLZAlgorithm(_BaseHLZAlgorithm):
+    """
+    Base for the three algorithms that automatically download data. They share
+    the search-parameter set (except AOI construction) and the full pipeline.
+    """
+
+    TDPDIAMETER = "TDPDIAMETER"
+    SLOPECAUTION = "SLOPECAUTION"
+    SLOPELIMIT = "SLOPELIMIT"
+    DEMDATASOURCE = "DEMDATASOURCE"
+
+    def _addCommonParameters(self):
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.TDPDIAMETER,
+                self.tr('Touchdown Point Diameter (m)'),
+                QgsProcessingParameterNumber.Integer,
+                minValue=0,
+                maxValue=500
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.SLOPECAUTION,
+                self.tr('Slope Caution Value (°)'),
+                QgsProcessingParameterNumber.Integer,
+                minValue=0,
+                maxValue=45
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.SLOPELIMIT,
+                self.tr('Slope Limit Value (°)'),
+                QgsProcessingParameterNumber.Integer,
+                minValue=0,
+                maxValue=45
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterEnum(
+                self.DEMDATASOURCE,
+                self.tr('DEM Data Source'),
+                options=self.DEMSOURCELIST,
+                defaultValue=0
+            )
+        )
+
+    def _addOutputParameters(self):
+        self.addParameter(
+            QgsProcessingParameterVectorDestination(
+                self.OUTPUTHLZPOINTS,
+                self.tr('Output HLZ Points'),
+                type=QgsProcessing.TypeVectorAnyGeometry
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterRasterDestination(
+                self.OUTPUTHLSRASTER,
+                self.tr('Output HLS Raster')
+            )
+        )
+
+    def _readCommonParameters(self, parameters, context):
+        return {
+            'tdp_diameter': self.parameterAsInt(parameters, self.TDPDIAMETER, context),
+            'slope_caution': self.parameterAsInt(parameters, self.SLOPECAUTION, context),
+            'slope_limit': self.parameterAsInt(parameters, self.SLOPELIMIT, context),
+            'dem_data_source': self.DEMSOURCELIST[self.parameterAsInt(parameters, self.DEMDATASOURCE, context)],
+            'output_hlz_points': self.parameterAsOutputLayer(parameters, self.OUTPUTHLZPOINTS, context),
+            'output_hls_raster': self.parameterAsOutputLayer(parameters, self.OUTPUTHLSRASTER, context),
+        }
+
+    def buildAoi(self, parameters, context, feedback, scratch_folder):
+        """Subclasses build and return the AOI layer (already in the model CRS)."""
+        raise NotImplementedError
+
+    def processAlgorithm(self, parameters, context, feedback):
+        common = self._readCommonParameters(parameters, context)
+
+        if feedback.isCanceled():
+            return {}
+
+        feedback.setProgressText('Performing Initial Setup...')
+        scratch_folder = self.newScratchFolder()
+
+        aoi_layer = self.buildAoi(parameters, context, feedback, scratch_folder)
+        if feedback.isCanceled():
+            return {}
+
+        clipped_dem_filename, clipped_lc_filename = self._downloadAndClipData(
+            aoi_layer, common['dem_data_source'], scratch_folder, feedback)
+        if feedback.isCanceled():
+            return {}
+
+        return self._computeHlsAndHlzs(
+            common['output_hls_raster'], common['output_hlz_points'],
+            clipped_dem_filename, clipped_lc_filename,
+            common['slope_caution'], common['slope_limit'], common['tdp_diameter'],
+            scratch_folder, context, feedback)
+
+
+class IdentifyHLZsFromLatLng(_BaseDownloadHLZAlgorithm):
+    """
+    Class to identify possible HLZs from lat/lng
+    """
+
+    LAT = "LAT"
+    LNG = "LNG"
+    SEARCHRADIUS = "SEARCHRADIUS"
+
+    def initAlgorithm(self, config):
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.LAT,
+                self.tr('Latitude (DDG)'),
+                QgsProcessingParameterNumber.Double,
+                minValue=-90.0,
+                maxValue=90.0
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.LNG,
+                self.tr('Longitude (DDG)'),
+                QgsProcessingParameterNumber.Double,
+                minValue=-180.0,
+                maxValue=180.0
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.SEARCHRADIUS,
+                self.tr('Search Radius (m)'),
+                QgsProcessingParameterNumber.Integer,
+                defaultValue=5000,
+                minValue=0,
+                maxValue=100000
+            )
+        )
+        self._addCommonParameters()
+        self._addOutputParameters()
+
+    def buildAoi(self, parameters, context, feedback, scratch_folder):
+        lat = self.parameterAsDouble(parameters, self.LAT, context)
+        lng = self.parameterAsDouble(parameters, self.LNG, context)
+        search_radius = self.parameterAsInt(parameters, self.SEARCHRADIUS, context)
+
+        # Create point feature from lat/lng values
+        coordinate_array = zeros((1, 3))
+        coordinate_array[0][0] = 1
+        coordinate_array[0][1] = lat
+        coordinate_array[0][2] = lng
+        df = DataFrame(coordinate_array, columns=['id', 'lat', 'lng'])
+        coordinate_table = os.path.join(scratch_folder, 'coordinate_table.csv')
+        df.to_csv(coordinate_table, index=False)
+
+        poi_layer = processing.run("native:createpointslayerfromtable", {
+            'INPUT': coordinate_table,
+            'XFIELD': 'lng',
+            'YFIELD': 'lat',
+            'ZFIELD': '',
+            'MFIELD': '',
+            'TARGET_CRS': QgsCoordinateReferenceSystem('EPSG:4326'),
+            'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
+
+        poi_projected_layer = processing.run("native:reprojectlayer", {'INPUT': poi_layer,
+                                                                       'TARGET_CRS': self.modelCrs(),
+                                                                       'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
+
+        return processing.run("native:buffer", {'INPUT': poi_projected_layer,
+                                                'DISTANCE': search_radius,
+                                                'SEGMENTS': 5,
+                                                'END_CAP_STYLE': 2,
+                                                'JOIN_STYLE': 1,
+                                                'MITER_LIMIT': 2,
+                                                'DISSOLVE': False,
+                                                'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
 
     def name(self):
         return 'Identify HLZs from Lat/Lng'
@@ -443,23 +428,11 @@ class IdentifyHLZsFromLatLng(QgsProcessingAlgorithm):
     def displayName(self):
         return self.tr(self.name())
 
-    def group(self):
-        return self.tr('Download Data')
-
-    def groupId(self):
-        return 'downloaddata'
-
-    def tr(self, string):
-        return QCoreApplication.translate('Processing', string)
-
     def createInstance(self):
         return IdentifyHLZsFromLatLng()
 
-    def helpUrl(self):
-        return "https://github.com/jojohn2468/openhlz/blob/master/README.md"
-
     def shortHelpString(self):
-        str = """
+        return """
         Identifies possible helicopter landing zones (HLZs) within an area of interest (AOI) based on a user-defined point (latitude/longitude) and search area.
 
         The algorithm uses elevation and land cover data automatically downloaded from online sources and takes input from user to determine slope constraints.
@@ -476,57 +449,24 @@ class IdentifyHLZsFromLatLng(QgsProcessingAlgorithm):
 
         'DEM Data Source' specifies the data source from which to download the elevation. See documentation on GitHub for more discussion on this topic.
 
-        WARNING: The possible HLZ locations identified by this plugin are for research purposes only.  The results of this plugin have not been evaluated for accuracy and should not be relied upon as the sole means for determining where to land an aircraft.  It is ultimately the responsibility of the pilot-in-command to determine the suitability of any location prior to landing their aircraft.  The developer of this plugin is not liable for ANY damage to equipment, bodily injury, or loss of life associated with its use.
-        """
-        return str
+        """ + self._WARNING
 
     def shortDescription(self):
         return "Identifies possible HLZs within an AOI centered on a user-defined point (lat/lng)"
 
     def icon(self):
-        return QIcon(path.dirname(__file__) + "/images/latlng_icon.svg")
+        return QIcon(os.path.join(PLUGIN_DIR, "images/latlng_icon.svg"))
 
 
-class IdentifyHLZsFromPoint(QgsProcessingAlgorithm):
+class IdentifyHLZsFromPoint(_BaseDownloadHLZAlgorithm):
     """
     Class to identify possible HLZs from a point
     """
 
-    # Constants used to refer to parameters and outputs. They will be
-    # used when calling the algorithm from another algorithm, or when
-    # calling from the QGIS console.
-
     INPUTPOINT = "INPUTPOINT"
     SEARCHRADIUS = "SEARCHRADIUS"
-    TDPDIAMETER = "TDPDIAMETER"
-    SLOPECAUTION = "SLOPECAUTION"
-    SLOPELIMIT = "SLOPELIMIT"
-    DEMDATASOURCE = "DEMDATASOURCE"
-
-    # Outputs
-    OUTPUTHLZPOINTS = "OUTPUTHLZPOINTS"
-    OUTPUTHLSRASTER = "OUTPUTHLSRASTER"
-
-    # Input lists
-    DEMSOURCELIST = [
-        '(Global) Copernicus GLO-30 (30m)',
-        '(US) 1/3 ArcSecond DEM (10m)'
-    ]
-
-    # Other constants
-    CODEFILENAME = 'openhlz_algorithm.py'
 
     def initAlgorithm(self, config):
-        """
-        Here we define the inputs and output of the algorithm, along
-        with some other properties.
-        """
-
-        # Save reference to project instance
-        self.instance = QgsProject.instance()
-
-        # Add input and output parameters
-        # Input point
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUTPOINT,
@@ -534,8 +474,6 @@ class IdentifyHLZsFromPoint(QgsProcessingAlgorithm):
                 [QgsProcessing.TypeVectorPoint]
             )
         )
-
-        # Input search radius
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.SEARCHRADIUS,
@@ -545,279 +483,25 @@ class IdentifyHLZsFromPoint(QgsProcessingAlgorithm):
                 maxValue=10000
             )
         )
+        self._addCommonParameters()
+        self._addOutputParameters()
 
-        # Input TDP diameter
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.TDPDIAMETER,
-                self.tr('Touchdown Point Diameter (m)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=500
-            )
-        )
-
-        # Input slope caution value
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SLOPECAUTION,
-                self.tr('Slope Caution Value (°)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=45
-            )
-        )
-
-        # Input slope limit value
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SLOPELIMIT,
-                self.tr('Slope Limit Value (°)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=45
-            )
-        )
-
-        # DEM Data Source
-        self.addParameter(
-            QgsProcessingParameterEnum(
-                self.DEMDATASOURCE,
-                self.tr('DEM Data Source'),
-                options=self.DEMSOURCELIST,
-                defaultValue=0
-            )
-        )
-
-        # Add output for HLZ points
-        self.addParameter(
-            QgsProcessingParameterVectorDestination(
-                self.OUTPUTHLZPOINTS,
-                self.tr('Output HLZ Points'),
-                type=QgsProcessing.TypeVectorAnyGeometry
-            )
-        )
-
-        # Add output for HLS raster
-        self.addParameter(
-            QgsProcessingParameterRasterDestination(
-                self.OUTPUTHLSRASTER,
-                self.tr('Output HLS Raster')
-            )
-        )
-
-    def processAlgorithm(self, parameters, context, feedback):
-        """
-        Main processing function
-        """
-
-        # Assign inputs to variables
+    def buildAoi(self, parameters, context, feedback, scratch_folder):
         input_point = self.parameterAsVectorLayer(parameters, self.INPUTPOINT, context)
         search_radius = self.parameterAsInt(parameters, self.SEARCHRADIUS, context)
-        tdp_diameter = self.parameterAsInt(parameters, self.TDPDIAMETER, context)
-        slope_caution = self.parameterAsInt(parameters, self.SLOPECAUTION, context)
-        slope_limit = self.parameterAsInt(parameters, self.SLOPELIMIT, context)
-        dem_source_list_index = self.parameterAsInt(parameters, self.DEMDATASOURCE, context)
-        dem_data_source = self.DEMSOURCELIST[dem_source_list_index]
 
-        # Assign outputs to variables
-        output_hlz_points = self.parameterAsOutputLayer(parameters, self.OUTPUTHLZPOINTS, context)
-        output_hls_raster = self.parameterAsOutputLayer(parameters, self.OUTPUTHLSRASTER, context)
-
-        """
-        ------------------------ Perform initial setup ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Performing Initial Setup...')
-
-        # Set initial working directory
-        current_path = __file__
-        working_directory = current_path.replace(self.CODEFILENAME, '')
-        chdir(working_directory)
-
-        # Define UTM layer (for LC data download)
-        utm_filename = 'data/World_UTM_Grid.shp'
-        utm_path = utm_filename
-        utm_layer = QgsVectorLayer(utm_path, 'World_UTM_Grid')
-
-        # Define 1/3 arc second DEM VRT (for DEM download)
-        vrt_filename = 'data/USGS_Seamless_DEM_13.vrt'
-
-        # Define necessary coordinate systems
-        model_coordinate_system_name = 'epsg:3857'
-        model_coordinate_system = QgsCoordinateReferenceSystem(model_coordinate_system_name)
-
-        # Paths for output styles
-        hls_style_path = 'styles/hls_raster_style.qml'
-        hlz_style_path = 'styles/hlz_points_style.qml'
-
-        # Create temporary directory for downloads/other data
-        temp_dir = TemporaryDirectory(delete=True, ignore_cleanup_errors=True)
-        scratch_folder = temp_dir.name
-
-        # Create AOI
         poi_projected_layer = processing.run("native:reprojectlayer", {'INPUT': input_point,
-                                                                       'TARGET_CRS': model_coordinate_system,
+                                                                       'TARGET_CRS': self.modelCrs(),
                                                                        'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
 
-        # Generate AOI
-        aoi_layer = processing.run("native:buffer", {'INPUT': poi_projected_layer,
-                                                     'DISTANCE': search_radius,
-                                                     'SEGMENTS': 5,
-                                                     'END_CAP_STYLE': 2,
-                                                     'JOIN_STYLE': 1,
-                                                     'MITER_LIMIT': 2,
-                                                     'DISSOLVE': False,
-                                                     'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
-
-        """
-        ------------------------ Download DEM Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Downloading Elevation Data...')
-
-        # Variable for output DEM filenames
-        dem_return = []
-
-        # Download Copernicus Data
-        if dem_data_source == self.DEMSOURCELIST[0]:
-
-            feedback.setProgressText("Downloading Copernicus Elevation Data...")
-            temp_return = downloadCopernicusGlo30Data(aoi_layer, scratch_folder, model_coordinate_system_name)
-            dem_return.append(temp_return)
-
-        # Else 10m data
-        else:
-            feedback.setProgressText("Downloading 10m Elevation Data...")
-            clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
-            processing.run("gdal:cliprasterbymasklayer", {'INPUT': vrt_filename,
-                                                          'MASK': aoi_layer,
-                                                          'SOURCE_CRS': None,
-                                                          'TARGET_CRS': aoi_layer.crs().authid(),
-                                                          'TARGET_EXTENT': None,
-                                                          'NODATA': None,
-                                                          'ALPHA_BAND': False,
-                                                          'CROP_TO_CUTLINE': True,
-                                                          'KEEP_RESOLUTION': False,
-                                                          'SET_RESOLUTION': False,
-                                                          'X_RESOLUTION': None,
-                                                          'Y_RESOLUTION': None,
-                                                          'MULTITHREADING': False,
-                                                          'OPTIONS': '',
-                                                          'DATA_TYPE': 6,
-                                                          'EXTRA': '',
-                                                          'OUTPUT': clipped_dem_filename})
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        """
-        ------------------------ Download Land Cover Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Downloading Land Cover Data...')
-
-        # Select UTM zones that intersect input AOI
-        processing.run("native:selectbylocation",
-                       {'INPUT': utm_layer,
-                        'PREDICATE': [0],
-                        'INTERSECT': aoi_layer,
-                        'METHOD': 0})
-        QgsVectorFileWriter.writeAsVectorFormat(utm_layer,
-                                                scratch_folder + '/selected_utm.shp',
-                                                'utf-8',
-                                                driverName='ESRI Shapefile',
-                                                onlySelected=True)
-        temp_selection = QgsVectorLayer(scratch_folder + '/selected_utm.shp', 'temp_selection')
-        temp_features = temp_selection.getFeatures()
-
-        # Get zone IDs for necessary land cover files
-        utm_zones = []
-        for feature in temp_features:
-            utm_zones.append([feature[1], feature[2]])
-
-        # Variable for output land cover filenames
-        lc_return = []
-
-        # Download necessary land cover files
-        for i in range(len(utm_zones)):
-            # Stop the algorithm if cancel button has been clicked
-            if feedback.isCanceled():
-                break
-            feedback.setProgressText('Downloading Land Cover Data ' + str(i + 1) + '/' + str(len(utm_zones)))
-            temp_return = downloadLandCoverRaster(i, utm_zones, scratch_folder)
-            lc_return.append(temp_return)
-
-        """
-        ------------------------ Mosaic and Clip Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Mosaicing and Clipping Data...')
-
-        # DEM Raster (only if Copernicus)
-        if dem_data_source == self.DEMSOURCELIST[0]:
-            clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
-            mosaicAndClipRasters(dem_return, aoi_layer, scratch_folder, clipped_dem_filename, self.instance)
-
-        # Land Cover Raster
-        clipped_lc_filename = scratch_folder + '/clipped_lc.tif'
-        mosaicAndClipRasters(lc_return, aoi_layer, scratch_folder, clipped_lc_filename, self.instance)
-
-        """
-        ------------------------ Calculate HLS Raster ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Calculating HLS Raster...')
-
-        hls_raster = generateHlsRaster(output_hls_raster, clipped_dem_filename, clipped_lc_filename, slope_caution,
-                                       slope_limit, model_coordinate_system, hls_style_path, self.instance,
-                                       scratch_folder)
-
-        """
-        ------------------------ ID HLZs ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Identifying Possible HLZs...')
-
-        # Identify HLZ points
-        hlz_points = identifyHlzs(output_hlz_points, hls_raster, tdp_diameter, model_coordinate_system,
-                                  hlz_style_path, self.instance, scratch_folder)
-
-        """
-        ------------------------ Return ---------------------------------
-        """
-
-        feedback.setProgressText('...Complete!')
-
-        return {
-            self.OUTPUTHLSRASTER: hls_raster,
-            self.OUTPUTHLZPOINTS: hlz_points
-        }
+        return processing.run("native:buffer", {'INPUT': poi_projected_layer,
+                                                'DISTANCE': search_radius,
+                                                'SEGMENTS': 5,
+                                                'END_CAP_STYLE': 2,
+                                                'JOIN_STYLE': 1,
+                                                'MITER_LIMIT': 2,
+                                                'DISSOLVE': False,
+                                                'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
 
     def name(self):
         return 'Identify HLZs from Point'
@@ -825,29 +509,17 @@ class IdentifyHLZsFromPoint(QgsProcessingAlgorithm):
     def displayName(self):
         return self.tr(self.name())
 
-    def group(self):
-        return self.tr('Download Data')
-
-    def groupId(self):
-        return 'downloaddata'
-
-    def tr(self, string):
-        return QCoreApplication.translate('Processing', string)
-
     def createInstance(self):
         return IdentifyHLZsFromPoint()
 
-    def helpUrl(self):
-        return "https://github.com/jojohn2468/openhlz/blob/master/README.md"
-
     def shortHelpString(self):
-        str = """
+        return """
         Identifies possible helicopter landing zones (HLZs) within an area of interest (AOI) based on a user-defined point (vector file) and search area.
 
         Algorithm uses elevation and land cover data automatically downloaded from online sources and takes input from user to determine slope constraints.
-        
+
         'Input Point' is the desired point of interest.  Multiple points can be specified.
-        
+
         'Search Radius' defines the radius of the generated AOI in meters.
 
         'Touchdown Point Diameter' is the diameter, in meters, of a suitable area a helicopter needs to safely land.
@@ -858,56 +530,23 @@ class IdentifyHLZsFromPoint(QgsProcessingAlgorithm):
 
         'DEM Data Source' specifies the data source from which to download the elevation. See documentation on GitHub for more discussion on this topic.
 
-        WARNING: The possible HLZ locations identified by this plugin are for research purposes only.  The results of this plugin have not been evaluated for accuracy and should not be relied upon as the sole means for determining where to land an aircraft.  It is ultimately the responsibiltiy of the pilot-in-command to determine the suitability of any location prior to landing their aircraft.  The developer of this plugin is not liable for ANY damage to equipment, bodily injury, or loss of life associated with its use.
-        """
-        return str
+        """ + self._WARNING
 
     def shortDescription(self):
         return "Identifies possible HLZs within an AOI centered on a user-defined point (vector file)"
 
     def icon(self):
-        return QIcon(path.dirname(__file__) + "/images/point_icon.svg")
+        return QIcon(os.path.join(PLUGIN_DIR, "images/point_icon.svg"))
 
 
-class IdentifyHLZsFromAoi(QgsProcessingAlgorithm):
+class IdentifyHLZsFromAoi(_BaseDownloadHLZAlgorithm):
     """
     Class to identify possible HLZs from aoi
     """
 
-    # Constants used to refer to parameters and outputs. They will be
-    # used when calling the algorithm from another algorithm, or when
-    # calling from the QGIS console.
-
     INPUTAOI = "INPUTAOI"
-    TDPDIAMETER = "TDPDIAMETER"
-    SLOPECAUTION = "SLOPECAUTION"
-    SLOPELIMIT = "SLOPELIMIT"
-    DEMDATASOURCE = "DEMDATASOURCE"
-
-    # Outputs
-    OUTPUTHLZPOINTS = "OUTPUTHLZPOINTS"
-    OUTPUTHLSRASTER = "OUTPUTHLSRASTER"
-
-    # Input lists
-    DEMSOURCELIST = [
-        '(Global) Copernicus GLO-30 (30m)',
-        '(US) 1/3 ArcSecond DEM (10m)'
-    ]
-
-    # Other constants
-    CODEFILENAME = 'openhlz_algorithm.py'
 
     def initAlgorithm(self, config):
-        """
-        Here we define the inputs and output of the algorithm, along
-        with some other properties.
-        """
-
-        # Save reference to project instance
-        self.instance = QgsProject.instance()
-
-        # Add input and output parameters
-        # Input AOI
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUTAOI,
@@ -915,268 +554,14 @@ class IdentifyHLZsFromAoi(QgsProcessingAlgorithm):
                 [QgsProcessing.TypeVectorPolygon]
             )
         )
+        self._addCommonParameters()
+        self._addOutputParameters()
 
-        # Input TDP diameter
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.TDPDIAMETER,
-                self.tr('Touchdown Point Diameter (m)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=500
-            )
-        )
-
-        # Input slope caution value
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SLOPECAUTION,
-                self.tr('Slope Caution Value (°)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=45
-            )
-        )
-
-        # Input slope limit value
-        self.addParameter(
-            QgsProcessingParameterNumber(
-                self.SLOPELIMIT,
-                self.tr('Slope Limit Value (°)'),
-                QgsProcessingParameterNumber.Integer,
-                minValue=0,
-                maxValue=45
-            )
-        )
-
-        # DEM Data Source
-        self.addParameter(
-            QgsProcessingParameterEnum(
-                self.DEMDATASOURCE,
-                self.tr('DEM Data Source'),
-                options=self.DEMSOURCELIST,
-                defaultValue=0
-            )
-        )
-
-        # Add output for HLZ points
-        self.addParameter(
-            QgsProcessingParameterVectorDestination(
-                self.OUTPUTHLZPOINTS,
-                self.tr('Output HLZ Points'),
-                type=QgsProcessing.TypeVectorAnyGeometry
-            )
-        )
-
-        # Add output for HLS raster
-        self.addParameter(
-            QgsProcessingParameterRasterDestination(
-                self.OUTPUTHLSRASTER,
-                self.tr('Output HLS Raster')
-            )
-        )
-
-    def processAlgorithm(self, parameters, context, feedback):
-        """
-        Main processing function
-        """
-
-        # Assign inputs to variables
+    def buildAoi(self, parameters, context, feedback, scratch_folder):
         input_aoi = self.parameterAsVectorLayer(parameters, self.INPUTAOI, context)
-        tdp_diameter = self.parameterAsInt(parameters, self.TDPDIAMETER, context)
-        slope_caution = self.parameterAsInt(parameters, self.SLOPECAUTION, context)
-        slope_limit = self.parameterAsInt(parameters, self.SLOPELIMIT, context)
-        dem_source_list_index = self.parameterAsInt(parameters, self.DEMDATASOURCE, context)
-        dem_data_source = self.DEMSOURCELIST[dem_source_list_index]
-
-        # Assign outputs to variables
-        output_hlz_points = self.parameterAsOutputLayer(parameters, self.OUTPUTHLZPOINTS, context)
-        output_hls_raster = self.parameterAsOutputLayer(parameters, self.OUTPUTHLSRASTER, context)
-
-        """
-        ------------------------ Perform initial setup ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Performing Initial Setup...')
-
-        # Set initial working directory
-        current_path = __file__
-        working_directory = current_path.replace(self.CODEFILENAME, '')
-        chdir(working_directory)
-
-        # Define UTM layer (for LC data download)
-        utm_filename = 'data/World_UTM_Grid.shp'
-        utm_path = utm_filename
-        utm_layer = QgsVectorLayer(utm_path, 'World_UTM_Grid')
-
-        # Define 1/3 arc second DEM VRT (for DEM download)
-        vrt_filename = 'data/USGS_Seamless_DEM_13.vrt'
-
-        # Define necessary coordinate systems
-        model_coordinate_system_name = 'epsg:3857'
-        model_coordinate_system = QgsCoordinateReferenceSystem(model_coordinate_system_name)
-
-        # Paths for output styles
-        hls_style_path = 'styles/hls_raster_style.qml'
-        hlz_style_path = 'styles/hlz_points_style.qml'
-
-        # Create temporary directory for downloads/other data
-        temp_dir = TemporaryDirectory(delete=True, ignore_cleanup_errors=True)
-        scratch_folder = temp_dir.name
-
-        # Project AOI
-        aoi_layer = processing.run("native:reprojectlayer", {'INPUT': input_aoi,
-                                                             'TARGET_CRS': model_coordinate_system,
-                                                             'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
-
-        """
-        ------------------------ Download DEM Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Downloading Elevation Data...')
-
-        # Variable for output DEM filenames
-        dem_return = []
-
-        # Download Copernicus Data
-        if dem_data_source == self.DEMSOURCELIST[0]:
-
-            feedback.setProgressText("Downloading Copernicus Elevation Data...")
-            temp_return = downloadCopernicusGlo30Data(aoi_layer, scratch_folder, model_coordinate_system_name)
-            dem_return.append(temp_return)
-
-        # Else 10m data
-        else:
-            feedback.setProgressText("Downloading 10m Elevation Data...")
-            clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
-            processing.run("gdal:cliprasterbymasklayer", {'INPUT': vrt_filename,
-                                                          'MASK': aoi_layer,
-                                                          'SOURCE_CRS': None,
-                                                          'TARGET_CRS': aoi_layer.crs().authid(),
-                                                          'TARGET_EXTENT': None,
-                                                          'NODATA': None,
-                                                          'ALPHA_BAND': False,
-                                                          'CROP_TO_CUTLINE': True,
-                                                          'KEEP_RESOLUTION': False,
-                                                          'SET_RESOLUTION': False,
-                                                          'X_RESOLUTION': None,
-                                                          'Y_RESOLUTION': None,
-                                                          'MULTITHREADING': False,
-                                                          'OPTIONS': '',
-                                                          'DATA_TYPE': 6,
-                                                          'EXTRA': '',
-                                                          'OUTPUT': clipped_dem_filename})
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        """
-        ------------------------ Download Land Cover Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Downloading Land Cover Data...')
-
-        # Select UTM zones that intersect input AOI
-        processing.run("native:selectbylocation",
-                       {'INPUT': utm_layer,
-                        'PREDICATE': [0],
-                        'INTERSECT': aoi_layer,
-                        'METHOD': 0})
-        QgsVectorFileWriter.writeAsVectorFormat(utm_layer,
-                                                scratch_folder + '/selected_utm.shp',
-                                                'utf-8',
-                                                driverName='ESRI Shapefile',
-                                                onlySelected=True)
-        temp_selection = QgsVectorLayer(scratch_folder + '/selected_utm.shp', 'temp_selection')
-        temp_features = temp_selection.getFeatures()
-
-        # Get zone IDs for necessary land cover files
-        utm_zones = []
-        for feature in temp_features:
-            utm_zones.append([feature[1], feature[2]])
-
-        # Variable for output land cover filenames
-        lc_return = []
-
-        # Download necessary land cover files
-        for i in range(len(utm_zones)):
-            # Stop the algorithm if cancel button has been clicked
-            if feedback.isCanceled():
-                break
-            feedback.setProgressText('Downloading Land Cover Data ' + str(i + 1) + '/' + str(len(utm_zones)))
-            temp_return = downloadLandCoverRaster(i, utm_zones, scratch_folder)
-            lc_return.append(temp_return)
-
-        """
-        ------------------------ Mosaic and Clip Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Mosaicing and Clipping Data...')
-
-        # DEM Raster (only if Copernicus)
-        if dem_data_source == self.DEMSOURCELIST[0]:
-            clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
-            mosaicAndClipRasters(dem_return, aoi_layer, scratch_folder, clipped_dem_filename, self.instance)
-
-        # Land Cover Raster
-        clipped_lc_filename = scratch_folder + '/clipped_lc.tif'
-        mosaicAndClipRasters(lc_return, aoi_layer, scratch_folder, clipped_lc_filename, self.instance)
-
-        """
-        ------------------------ Calculate HLS Raster ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Calculating HLS Raster...')
-
-        hls_raster = generateHlsRaster(output_hls_raster, clipped_dem_filename, clipped_lc_filename, slope_caution,
-                                       slope_limit, model_coordinate_system, hls_style_path, self.instance,
-                                       scratch_folder)
-
-        """
-        ------------------------ ID HLZs ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Identifying Possible HLZs...')
-
-        # Identify HLZ points
-        hlz_points = identifyHlzs(output_hlz_points, hls_raster, tdp_diameter, model_coordinate_system,
-                                  hlz_style_path, self.instance, scratch_folder)
-
-        """
-        ------------------------ Return ---------------------------------
-        """
-
-        feedback.setProgressText('...Complete!')
-
-        return {
-            self.OUTPUTHLSRASTER: hls_raster,
-            self.OUTPUTHLZPOINTS: hlz_points
-        }
+        return processing.run("native:reprojectlayer", {'INPUT': input_aoi,
+                                                         'TARGET_CRS': self.modelCrs(),
+                                                         'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
 
     def name(self):
         return 'Identify HLZs from AOI'
@@ -1184,28 +569,16 @@ class IdentifyHLZsFromAoi(QgsProcessingAlgorithm):
     def displayName(self):
         return self.tr(self.name())
 
-    def group(self):
-        return self.tr('Download Data')
-
-    def groupId(self):
-        return 'downloaddata'
-
-    def tr(self, string):
-        return QCoreApplication.translate('Processing', string)
-
     def createInstance(self):
         return IdentifyHLZsFromAoi()
 
-    def helpUrl(self):
-        return "https://github.com/jojohn2468/openhlz/blob/master/README.md"
-
     def shortHelpString(self):
-        str = """
+        return """
         Identifies possible helicopter landing zones (HLZs) within a user-defined area of interest (AOI) input as a vector file.
 
         Algorithm uses elevation and land cover data automatically downloaded from online sources and takes input from user to determine slope constraints.
-        
-        'Input AOI' is the desired search area.  Multiple polygons can be included (within a singular feature source). 
+
+        'Input AOI' is the desired search area.  Multiple polygons can be included (within a singular feature source).
 
         'Touchdown Point Diameter' is the diameter, in meters, of a suitable area a helicopter needs to safely land.
 
@@ -1215,25 +588,19 @@ class IdentifyHLZsFromAoi(QgsProcessingAlgorithm):
 
         'DEM Data Source' specifies the data source from which to download the elevation. See documentation on GitHub for more discussion on this topic.
 
-        WARNING: The possible HLZ locations identified by this plugin are for research purposes only.  The results of this plugin have not been evaluated for accuracy and should not be relied upon as the sole means for determining where to land an aircraft.  It is ultimately the responsibiltiy of the pilot-in-command to determine the suitability of any location prior to landing their aircraft.  The developer of this plugin is not liable for ANY damage to equipment, bodily injury, or loss of life associated with its use.
-        """
-        return str
+        """ + self._WARNING
 
     def shortDescription(self):
         return "Identifies possible HLZs within a user-defined AOI (vector file)"
 
     def icon(self):
-        return QIcon(path.dirname(__file__) + "/images/polygon_icon.svg")
+        return QIcon(os.path.join(PLUGIN_DIR, "images/polygon_icon.svg"))
 
 
-class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
+class IdentifyHLZsFromExistingData(_BaseHLZAlgorithm):
     """
     Class to identify possible HLZs from already downloaded data
     """
-
-    # Constants used to refer to parameters and outputs. They will be
-    # used when calling the algorithm from another algorithm, or when
-    # calling from the QGIS console.
 
     INPUTDEM = "INPUTDEM"
     INPUTLANDCOVER = "INPUTLANDCOVER"
@@ -1243,48 +610,31 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
     SLOPECAUTION = "SLOPECAUTION"
     SLOPELIMIT = "SLOPELIMIT"
 
-    # Outputs
-    OUTPUTHLZPOINTS = "OUTPUTHLZPOINTS"
-    OUTPUTHLSRASTER = "OUTPUTHLSRASTER"
+    def group(self):
+        return self.tr('Existing Data')
 
-    # Other constants
-    CODEFILENAME = 'openhlz_algorithm.py'
+    def groupId(self):
+        return 'existingdata'
 
     def initAlgorithm(self, config):
-        """
-        Here we define the inputs and output of the algorithm, along
-        with some other properties.
-        """
-
-        # Save reference to project instance
-        self.instance = QgsProject.instance()
-
-        # Add input and output parameters
-        # Input DEM
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.INPUTDEM,
                 self.tr('Input Elevation Raster')
             )
         )
-
-        # Input Land Cover
         self.addParameter(
             QgsProcessingParameterRasterLayer(
                 self.INPUTLANDCOVER,
                 self.tr('Input Land Cover Raster')
             )
         )
-
-        # Input Land Cover Classes
         self.addParameter(
             QgsProcessingParameterString(
                 self.INPUTLANDCOVERCLASSES,
                 self.tr('Suitable Land Cover Class Pixel Values (comma-separated, no strings)')
             )
         )
-
-        # Input AOI
         self.addParameter(
             QgsProcessingParameterFeatureSource(
                 self.INPUTAOI,
@@ -1292,8 +642,6 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                 [QgsProcessing.TypeVectorPolygon]
             )
         )
-
-        # Input TDP diameter
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.TDPDIAMETER,
@@ -1303,8 +651,6 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                 maxValue=500
             )
         )
-
-        # Input slope caution value
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.SLOPECAUTION,
@@ -1314,8 +660,6 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                 maxValue=45
             )
         )
-
-        # Input slope limit value
         self.addParameter(
             QgsProcessingParameterNumber(
                 self.SLOPELIMIT,
@@ -1325,8 +669,6 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                 maxValue=45
             )
         )
-
-        # Add output for HLZ points
         self.addParameter(
             QgsProcessingParameterVectorDestination(
                 self.OUTPUTHLZPOINTS,
@@ -1334,8 +676,6 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                 type=QgsProcessing.TypeVectorAnyGeometry
             )
         )
-
-        # Add output for HLS raster
         self.addParameter(
             QgsProcessingParameterRasterDestination(
                 self.OUTPUTHLSRASTER,
@@ -1344,11 +684,6 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
         )
 
     def processAlgorithm(self, parameters, context, feedback):
-        """
-        Main processing function
-        """
-
-        # Assign inputs to variables
         input_dem = self.parameterAsRasterLayer(parameters, self.INPUTDEM, context)
         input_land_cover = self.parameterAsRasterLayer(parameters, self.INPUTLANDCOVER, context)
         input_land_cover_classes = self.parameterAsString(parameters, self.INPUTLANDCOVERCLASSES, context)
@@ -1357,54 +692,27 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
         slope_caution = self.parameterAsInt(parameters, self.SLOPECAUTION, context)
         slope_limit = self.parameterAsInt(parameters, self.SLOPELIMIT, context)
 
-        # Assign outputs to variables
         output_hlz_points = self.parameterAsOutputLayer(parameters, self.OUTPUTHLZPOINTS, context)
         output_hls_raster = self.parameterAsOutputLayer(parameters, self.OUTPUTHLSRASTER, context)
 
-        """
-        ------------------------ Perform initial setup ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
         if feedback.isCanceled():
-            return
+            return {}
 
         feedback.setProgressText('Performing Initial Setup...')
-
-        # Set initial working directory
-        current_path = __file__
-        working_directory = current_path.replace(self.CODEFILENAME, '')
-        chdir(working_directory)
-
-        # Define necessary coordinate systems
-        model_coordinate_system_name = 'epsg:3857'
-        model_coordinate_system = QgsCoordinateReferenceSystem(model_coordinate_system_name)
-
-        # Paths for output styles
-        hls_style_path = 'styles/hls_raster_style.qml'
-        hlz_style_path = 'styles/hlz_points_style.qml'
-
-        # Create temporary directory for downloads/other data
-        temp_dir = TemporaryDirectory(delete=True, ignore_cleanup_errors=True)
-        scratch_folder = temp_dir.name
+        scratch_folder = self.newScratchFolder()
 
         # Project AOI
         aoi_layer = processing.run("native:reprojectlayer", {'INPUT': input_aoi,
-                                                             'TARGET_CRS': model_coordinate_system,
+                                                             'TARGET_CRS': self.modelCrs(),
                                                              'OUTPUT': 'TEMPORARY_OUTPUT'})['OUTPUT']
 
-        """
-        ------------------------ Mosaic and Clip Data ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
         if feedback.isCanceled():
-            return
+            return {}
 
         feedback.setProgressText('Clipping Data to AOI...')
 
         # DEM Raster
-        clipped_dem_filename = scratch_folder + '/clipped_dem.tif'
+        clipped_dem_filename = os.path.join(scratch_folder, 'clipped_dem.tif')
         dem_data_type = int(input_dem.dataProvider().dataType(0))
         processing.run("gdal:cliprasterbymasklayer",
                        {'INPUT': input_dem,
@@ -1426,7 +734,7 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                         'OUTPUT': clipped_dem_filename})
 
         # Land Cover Raster
-        clipped_lc_filename = scratch_folder + '/clipped_lc.tif'
+        clipped_lc_filename = os.path.join(scratch_folder, 'clipped_lc.tif')
         land_cover_data_type = int(input_land_cover.dataProvider().dataType(0))
         processing.run("gdal:cliprasterbymasklayer",
                        {'INPUT': input_land_cover,
@@ -1447,44 +755,13 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
                         'EXTRA': '',
                         'OUTPUT': clipped_lc_filename})
 
-        """
-        ------------------------ Calculate HLS Raster ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
         if feedback.isCanceled():
-            return
+            return {}
 
-        feedback.setProgressText('Calculating HLS Raster...')
-
-        hls_raster = generateHlsRaster(output_hls_raster, clipped_dem_filename, clipped_lc_filename, slope_caution,
-                                       slope_limit, model_coordinate_system, hls_style_path, self.instance,
-                                       scratch_folder, suitable_land_cover_classes=input_land_cover_classes)
-
-        """
-        ------------------------ ID HLZs ---------------------------------
-        """
-
-        # Stop the algorithm if cancel button has been clicked
-        if feedback.isCanceled():
-            return
-
-        feedback.setProgressText('Identifying Possible HLZs...')
-
-        # Identify HLZ points
-        hlz_points = identifyHlzs(output_hlz_points, hls_raster, tdp_diameter, model_coordinate_system,
-                                  hlz_style_path, self.instance, scratch_folder)
-
-        """
-        ------------------------ Return ---------------------------------
-        """
-
-        feedback.setProgressText('...Complete!')
-
-        return {
-            self.OUTPUTHLSRASTER: hls_raster,
-            self.OUTPUTHLZPOINTS: hlz_points
-        }
+        return self._computeHlsAndHlzs(
+            output_hls_raster, output_hlz_points, clipped_dem_filename, clipped_lc_filename,
+            slope_caution, slope_limit, tdp_diameter, scratch_folder, context, feedback,
+            land_cover_classes=input_land_cover_classes)
 
     def name(self):
         return 'Identify HLZs from Existing Data'
@@ -1492,29 +769,17 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
     def displayName(self):
         return self.tr(self.name())
 
-    def group(self):
-        return self.tr('Existing Data')
-
-    def groupId(self):
-        return 'existingdata'
-
-    def tr(self, string):
-        return QCoreApplication.translate('Processing', string)
-
     def createInstance(self):
         return IdentifyHLZsFromExistingData()
 
-    def helpUrl(self):
-        return "https://github.com/jojohn2468/openhlz/blob/master/README.md"
-
     def shortHelpString(self):
-        str = """
+        return """
         Identifies possible helicopter landing zones (HLZs) within a user-defined area of interest (AOI) using existing data.
-        
+
         'Input Elevation Raster' and 'Input Land Cover Raster' are the existing elevation and land cover data for an area.
-        
+
         'Suitable Land Cover Class Pixel Values' are classes in the land cover raster that the model will classify as suitable (i.e. grassland).  These should be input as pixel values separated by commas with no spaces.
-        
+
         'Input AOI' is the desired search area.
 
         'Touchdown Point Diameter' is the diameter, in meters, of a suitable area a helicopter needs to safely land.
@@ -1523,12 +788,10 @@ class IdentifyHLZsFromExistingData(QgsProcessingAlgorithm):
 
         'Slope Limit Value' defines the slope magnitude, in degrees, beyond which a helicopter touching down WILL exceed a slope limitation.
 
-        WARNING: The possible HLZ locations identified by this plugin are for research purposes only.  The results of this plugin have not been evaluated for accuracy and should not be relied upon as the sole means for determining where to land an aircraft.  It is ultimately the responsibiltiy of the pilot-in-command to determine the suitability of any location prior to landing their aircraft.  The developer of this plugin is not liable for ANY damage to equipment, bodily injury, or loss of life associated with its use.
-        """
-        return str
+        """ + self._WARNING
 
     def shortDescription(self):
         return "Identifies possible HLZs within a user-defined AOI (vector file) using already downloaded data"
 
     def icon(self):
-        return QIcon(path.dirname(__file__) + "/images/polygon_icon.svg")
+        return QIcon(os.path.join(PLUGIN_DIR, "images/polygon_icon.svg"))

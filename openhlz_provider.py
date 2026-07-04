@@ -10,8 +10,8 @@
         begin                : 2023-08-13
         copyright            : (C) 2026 by CustomCartographix
         email                : john@customcartographix.com
-        version              : 2.0.0
-        version date         : 2026-01-31
+        version              : 2.0.1
+        version date         : 2026-07-04
  ***************************************************************************/
 
 /***************************************************************************
@@ -85,4 +85,4 @@ class OpenHLZProvider(QgsProcessingProvider):
         """
         Returns a longer version of the provider name
         """
-        return 'OpenHLZ v1.0.0'
+        return 'OpenHLZ v2.0.1'
